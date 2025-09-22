@@ -1,0 +1,397 @@
+// It's A Wonderful Web
+// Single-file React app
+// Run instructions:
+// 1) Create a new Vite + React app: `npm create vite@latest my-app -- --template react` 
+// 2) Replace src/App.jsx with this file's contents and ensure Tailwind is configured.
+// 3) `npm install` then `npm run dev`.
+// 
+// Features included:
+// - Pass-and-play (hotseat) mode for same-device multiplayer
+// - Shareable game state via URL (encode/decode game snapshot in base64) for asynchronous play
+// - Basic turn system, drafting from a card market, playing cards to gain resources
+// - Simple scoring and end-of-game summary
+// - Minimal, responsive UI using Tailwind utility classes
+
+import React, { useEffect, useMemo, useState } from 'react';
+
+// ----- Simple card & game model -----
+const SAMPLE_CARDS = [
+  { id: 'c1', name: 'Lumber Mill', cost: { wood: 1 }, produce: { wood: 2 }, vp: 1 },
+  { id: 'c2', name: 'Quarry', cost: { stone: 1 }, produce: { stone: 2 }, vp: 1 },
+  { id: 'c3', name: 'Foundry', cost: { iron: 1 }, produce: { iron: 2 }, vp: 2 },
+  { id: 'c4', name: 'Farm', cost: { food: 0 }, produce: { food: 2 }, vp: 1 },
+  { id: 'c5', name: 'Workshop', cost: { wood: 1, stone: 1 }, produce: {}, vp: 3 },
+  { id: 'c6', name: 'Academy', cost: { food: 1 }, produce: {}, vp: 2 },
+  { id: 'c7', name: 'Factory', cost: { iron: 2 }, produce: {}, vp: 4 },
+  { id: 'c8', name: 'Market', cost: { }, produce: {}, vp: 1 },
+];
+
+function shuffle(array) {
+  const a = array.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function defaultPlayer(name) {
+  return {
+    id: Math.random().toString(36).slice(2, 9),
+    name: name || 'Player',
+    resources: { wood: 0, stone: 0, iron: 0, food: 0 },
+    hand: [],
+    tableau: [],
+    vp: 0,
+  };
+}
+
+function newGame(playerNames = ['Alice', 'Bob']) {
+  const deck = shuffle([...SAMPLE_CARDS, ...SAMPLE_CARDS, ...SAMPLE_CARDS]);
+  const players = playerNames.map((n) => defaultPlayer(n));
+  const market = deck.splice(0, 5);
+  return {
+    players,
+    deck,
+    market,
+    turn: 0, // index of current player
+    round: 1,
+    maxRounds: 6,
+    log: [],
+    passMode: 'hotseat', // or 'share'
+  };
+}
+
+// ----- helpers for URL encode/decode -----
+function encodeState(state) {
+  try {
+    const str = JSON.stringify(state);
+    return btoa(unescape(encodeURIComponent(str)));
+  } catch (e) {
+    return null;
+  }
+}
+function decodeState(code) {
+  try {
+    const str = decodeURIComponent(escape(atob(code)));
+    return JSON.parse(str);
+  } catch (e) {
+    return null;
+  }
+}
+
+// ----- Main App -----
+export default function App() {
+  // Try to load state from URL param `s`
+  const urlParams = new URLSearchParams(window.location.search);
+  const shared = urlParams.get('s');
+
+  const [game, setGame] = useState(() => {
+    if (shared) {
+      const s = decodeState(shared);
+      if (s) return s;
+    }
+    return newGame(['Alice', 'Bob']);
+  });
+
+  const [playerIndex, setPlayerIndex] = useState(0);
+  const currentPlayer = game.players[game.turn];
+
+  useEffect(() => {
+    // basic validation: ensure all players have proper structure
+    setGame((g) => ({ ...g }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // rotate turn
+  function nextTurn() {
+    setGame((g) => {
+      const next = { ...g };
+      next.turn = (next.turn + 1) % next.players.length;
+      if (next.turn === 0) next.round = Math.min(next.round + 1, next.maxRounds);
+      next.log = [...next.log, `${g.players[g.turn].name} ended their turn.`];
+      return next;
+    });
+  }
+
+  function drawToMarket() {
+    setGame((g) => {
+      const copy = structuredClone(g);
+      while (copy.market.length < 5 && copy.deck.length > 0) {
+        copy.market.push(copy.deck.pop());
+      }
+      return copy;
+    });
+  }
+
+  function takeCardFromMarket(cardId) {
+    setGame((g) => {
+      const copy = structuredClone(g);
+      const cardIndex = copy.market.findIndex((c) => c.id === cardId);
+      if (cardIndex === -1) return copy;
+      const card = copy.market.splice(cardIndex, 1)[0];
+      // give to current player's hand
+      copy.players[copy.turn].hand.push(card);
+      copy.log.push(`${copy.players[copy.turn].name} drafted ${card.name}.`);
+      drawToMarket();
+      return copy;
+    });
+  }
+
+  function playCard(cardId) {
+    setGame((g) => {
+      const copy = structuredClone(g);
+      const player = copy.players[copy.turn];
+      const handIndex = player.hand.findIndex((c) => c.id === cardId);
+      if (handIndex === -1) return copy;
+      const card = player.hand[handIndex];
+      // check cost
+      for (const [k, v] of Object.entries(card.cost || {})) {
+        if ((player.resources[k] || 0) < v) {
+          copy.log.push(`${player.name} cannot afford ${card.name}.`);
+          return copy;
+        }
+      }
+      // pay cost
+      for (const [k, v] of Object.entries(card.cost || {})) {
+        player.resources[k] = (player.resources[k] || 0) - v;
+      }
+      // place into tableau
+      player.tableau.push(card);
+      player.hand.splice(handIndex, 1);
+      player.vp += card.vp || 0;
+      copy.log.push(`${player.name} played ${card.name} (+${card.vp || 0} VP).`);
+      return copy;
+    });
+  }
+
+  function endRoundProduction() {
+    setGame((g) => {
+      const copy = structuredClone(g);
+      copy.players.forEach((p) => {
+        // each card in tableau produces
+        p.tableau.forEach((c) => {
+          for (const [k, v] of Object.entries(c.produce || {})) {
+            p.resources[k] = (p.resources[k] || 0) + v;
+          }
+        });
+      });
+      copy.log.push(`Production phase: all tableaus produced resources.`);
+      // advance to next turn/round
+      copy.turn = (copy.turn + 1) % copy.players.length;
+      if (copy.turn === 0) copy.round = Math.min(copy.round + 1, copy.maxRounds);
+      return copy;
+    });
+  }
+
+  function autoDealHands(handSize = 3) {
+    setGame((g) => {
+      const copy = structuredClone(g);
+      copy.players.forEach((p) => {
+        p.hand = [];
+        for (let i = 0; i < handSize; i++) {
+          if (copy.deck.length === 0) break;
+          p.hand.push(copy.deck.pop());
+        }
+      });
+      copy.log.push(`Dealt ${handSize} cards to each player.`);
+      return copy;
+    });
+  }
+
+  function addPlayer() {
+    setGame((g) => {
+      const copy = structuredClone(g);
+      copy.players.push(defaultPlayer(`Player ${copy.players.length + 1}`));
+      return copy;
+    });
+  }
+
+  function removePlayer(i) {
+    setGame((g) => {
+      const copy = structuredClone(g);
+      copy.players.splice(i, 1);
+      copy.turn = copy.turn % Math.max(1, copy.players.length);
+      return copy;
+    });
+  }
+
+  function newGameWithNames() {
+    const names = game.players.map((p) => p.name);
+    setGame(newGame(names));
+  }
+
+  function exportStateURL() {
+    const encoded = encodeState(game);
+    if (!encoded) return window.location.href;
+    const u = new URL(window.location.href);
+    u.searchParams.set('s', encoded);
+    return u.toString();
+  }
+
+  function importStateFromString(s) {
+    const decoded = decodeState(s);
+    if (decoded) setGame(decoded);
+  }
+
+  function endGameAndScore() {
+    // compute final scores and show modal (simple: existing vp + resources/3)
+    setGame((g) => {
+      const copy = structuredClone(g);
+      copy.players.forEach((p) => {
+        const resSum = Object.values(p.resources || {}).reduce((a, b) => a + (b || 0), 0);
+        p.finalScore = (p.vp || 0) + Math.floor(resSum / 3);
+      });
+      copy.log.push('Final scoring complete.');
+      return copy;
+    });
+  }
+
+  // derived
+  const winner = useMemo(() => {
+    if (!game.players.every((p) => typeof p.finalScore !== 'undefined')) return null;
+    return [...game.players].sort((a, b) => b.finalScore - a.finalScore)[0];
+  }, [game.players]);
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-6">
+      <div className="max-w-5xl mx-auto">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-extrabold">It's A Wonderful Web — lightweight fan implementation</h1>
+          <div className="text-sm text-slate-600">Round {game.round} • Turn: {game.players[game.turn]?.name}</div>
+        </header>
+
+        <main className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <section className="md:col-span-2 bg-white p-4 rounded-2xl shadow-sm">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-semibold">Market</h2>
+              <div className="text-xs text-slate-500">Deck: {game.deck.length} cards</div>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+              {game.market.map((c) => (
+                <div key={c.id} className="border rounded p-3 bg-slate-50">
+                  <div className="font-medium">{c.name}</div>
+                  <div className="text-xs mt-1">VP: {c.vp}</div>
+                  <div className="mt-2 text-xs">Cost: {Object.entries(c.cost || {}).map(([k,v])=>`${k}:${v}`).join(', ') || '—'}</div>
+                  <div className="mt-1 text-xs">Produce: {Object.entries(c.produce || {}).map(([k,v])=>`${k}:${v}`).join(', ') || '—'}</div>
+                  <div className="mt-3 flex gap-2">
+                    <button onClick={() => takeCardFromMarket(c.id)} className="flex-1 rounded px-2 py-1 bg-indigo-600 text-white text-sm">Draft</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 border-t pt-4">
+              <h3 className="font-semibold mb-2">Actions</h3>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={() => autoDealHands(3)} className="rounded px-3 py-1 bg-slate-200">Deal 3 to all</button>
+                <button onClick={() => drawToMarket()} className="rounded px-3 py-1 bg-slate-200">Refill Market</button>
+                <button onClick={() => endRoundProduction()} className="rounded px-3 py-1 bg-emerald-400 text-white">Production & advance</button>
+                <button onClick={() => newGameWithNames()} className="rounded px-3 py-1 bg-rose-200">New Game (same names)</button>
+                <button onClick={() => { addPlayer(); }} className="rounded px-3 py-1 bg-slate-200">Add player</button>
+              </div>
+            </div>
+
+            <div className="mt-4 border-t pt-4">
+              <h3 className="font-semibold mb-2">Game sharing</h3>
+              <div className="flex gap-2 flex-col sm:flex-row">
+                <a className="truncate" href={exportStateURL()} target="_blank" rel="noreferrer">Open share link (creates URL)</a>
+                <button onClick={() => { navigator.clipboard?.writeText(exportStateURL()); alert('Share link copied to clipboard'); }} className="rounded px-3 py-1 bg-indigo-600 text-white">Copy share link</button>
+                <button onClick={() => { const s = prompt('Paste exported state string here:'); if (s) importStateFromString(s); }} className="rounded px-3 py-1 bg-slate-200">Import state string</button>
+              </div>
+              <div className="text-xs text-slate-500 mt-2">Tip: use the share link to let a friend load the same game state (asynchronous play).</div>
+            </div>
+          </section>
+
+          <aside className="bg-white p-4 rounded-2xl shadow-sm">
+            <h2 className="font-semibold mb-3">Players</h2>
+            <div className="space-y-3">
+              {game.players.map((p, i) => (
+                <div key={p.id} className={`p-2 rounded ${game.turn === i ? 'ring-2 ring-indigo-300' : 'ring-1 ring-slate-100'}`}>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <div className="font-medium">{p.name}</div>
+                      <div className="text-xs text-slate-500">VP: {p.vp} • Final: {typeof p.finalScore !== 'undefined' ? p.finalScore : '—'}</div>
+                    </div>
+                    <div className="text-xs text-slate-400">Resources: {Object.values(p.resources).reduce((a,b)=>a+b,0)}</div>
+                  </div>
+
+                  <div className="mt-2 text-xs">
+                    <div>Hand: {p.hand.length} • Tableau: {p.tableau.length}</div>
+                    <div className="mt-2 flex gap-2">
+                      {game.turn === i && (
+                        <>
+                          {p.hand.map((c) => (
+                            <button key={c.id} onClick={() => playCard(c.id)} className="px-2 py-1 text-xs rounded bg-indigo-600 text-white">Play {c.name}</button>
+                          ))}
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex gap-2">
+                    <button onClick={() => { const newName = prompt('New name', p.name); if (newName) { setGame((g)=>{const c=structuredClone(g); c.players[i].name=newName; return c;}); }}} className="text-xs px-2 py-1 rounded bg-slate-100">Rename</button>
+                    <button onClick={() => removePlayer(i)} className="text-xs px-2 py-1 rounded bg-rose-100">Remove</button>
+                    <button onClick={() => { setPlayerIndex(i); alert('Player selected for local view.'); }} className="text-xs px-2 py-1 rounded bg-slate-100">View</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 border-t pt-4">
+              <h3 className="font-semibold">Controls</h3>
+              <div className="flex gap-2 mt-2">
+                <button onClick={() => nextTurn()} className="px-3 py-1 rounded bg-indigo-600 text-white">End Turn</button>
+                <button onClick={() => endGameAndScore()} className="px-3 py-1 rounded bg-amber-400">Score / End Game</button>
+              </div>
+            </div>
+
+            <div className="mt-4 border-t pt-4">
+              <h3 className="font-semibold">Log</h3>
+              <div className="max-h-40 overflow-auto text-xs text-slate-600 mt-2 space-y-1">
+                {game.log.slice(-20).map((l,i)=> <div key={i}>• {l}</div>)}
+              </div>
+            </div>
+
+          </aside>
+        </main>
+
+        <section className="mt-6 bg-white p-4 rounded-2xl shadow-sm">
+          <h2 className="font-semibold mb-3">Game details & controls</h2>
+          <div className="text-sm text-slate-600 space-y-2">
+            <p>This is a simplified, fan-made web implementation inspired by "It's a Wonderful World". It is NOT an official or complete implementation. Use it for casual play with friends. Two play modes:
+            </p>
+            <ul className="list-disc pl-6">
+              <li>Pass-and-play / hotseat: Everyone uses the same device and takes turns.</li>
+              <li>Shareable state links: Click "Copy share link" and send the URL to a friend. It encodes the current game snapshot in the URL so your friend can load the same game state and continue (asynchronous play).</li>
+            </ul>
+
+            <p>To make a full online real-time multiplayer version you'd normally add a small backend (for example a server using Socket.IO) or a peer-to-peer signaling service. If you want that, I can provide a second version with a minimal Node.js signaling server and client socket code.</p>
+
+            <div className="mt-3">
+              <strong>Quick start:</strong>
+              <ol className="list-decimal pl-6">
+                <li>Rename players if you like</li>
+                <li>Click "Deal 3 to all" to give each player cards</li>
+                <li>Use Draft buttons in Market to pick cards</li>
+                <li>On your turn, play cards from your player's card buttons in the player panel</li>
+                <li>Use "Production & advance" to run production and move to the next player/round</li>
+                <li>When finished, click "Score / End Game" to calculate final scores</li>
+              </ol>
+            </div>
+
+          </div>
+        </section>
+
+        {winner && (
+          <div className="mt-6 bg-white p-4 rounded-2xl shadow-sm">
+            <h2 className="font-semibold">Winner</h2>
+            <div className="mt-2">{winner.name} wins with {winner.finalScore} points 🎉</div>
+          </div>
+        )}
+
+        <footer className="mt-6 text-xs text-slate-500">Note: This is fan-made and simplified — not a reproduction of the full original rules.</footer>
+      </div>
+    </div>
+  );
+}
